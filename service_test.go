@@ -6,7 +6,6 @@ package cloudinary
 
 import (
 	"fmt"
-	"net/url"
 	"os"
 	"testing"
 )
@@ -36,11 +35,7 @@ func TestDial(t *testing.T) {
 		t.Error("expect a working service at this stage but got an error.")
 	}
 	if s.cloudName != k.cloudName || s.apiKey != k.apiKey || s.apiSecret != k.apiSecret {
-		t.Errorf("wrong service instance. Expect %v, got %v", k, s)
-	}
-	uexp := fmt.Sprintf("%s/%s/image/upload/", baseUploadURL, s.cloudName)
-	if s.uploadURI.String() != uexp {
-		t.Errorf("wrong upload URI. Expect %s, got %s", uexp, s.uploadURI.String())
+		t.Errorf("wrong service instance, expect %v, got %v", k, s)
 	}
 }
 
@@ -50,16 +45,11 @@ func TestUploadByFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f, err := os.Open("test_logo.png")
+	r, err := s.UploadByFile("test_logo.png", "image")
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	id, err := s.UploadImageFile(f, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Log(id)
+	t.Log(r)
 }
 
 func TestUploadByURL(t *testing.T) {
@@ -68,14 +58,32 @@ func TestUploadByURL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	imgURL, err := url.Parse("https://en.wikipedia.org/w/skins/Vector/images/user-avatar.svg?b7f58")
+	r, err := s.UploadByURL("https://res.cloudinary.com/demo/image/upload/v1584624255/sample.jpg", "image")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log(r)
+}
+
+func TestUploadDestroy(t *testing.T) {
+	s, err := Dial(os.Getenv("CLOUDINARY"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	id, err := s.UploadImageURL(imgURL, "")
-	if err != nil {
+	publicID := os.Getenv("CLOUDINARY_PUBLIC_ID")
+	if publicID == "" {
+		r, err := s.UploadByFile("test_logo.png", "image")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		publicID = r.PublicID
+
+		t.Log(publicID)
+	}
+
+	if err := s.UploadDestroy(publicID, "image"); err != nil {
 		t.Fatal(err)
 	}
-	t.Log(id)
 }

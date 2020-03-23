@@ -1,5 +1,5 @@
 // Copyright 2013 Mathias Monnerville and Anthony Baillard.
-// Modified 2020 Simon Partridge & Benjamin King
+// Modified 2020 Simon Partridge & Benjamin King & Habib Rosyad
 // All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
@@ -22,12 +22,16 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
 const (
-	baseUploadURL = "https://api.cloudinary.com/v1_1"
+	baseURL      = "https://api.cloudinary.com/v1_1"
+	uploadAPIFmt = baseURL + "/%s/%s/%s" // /:cloud_name/:resource_type/:method
 )
 
 // Service is the cloudinary service
@@ -37,141 +41,185 @@ type Service struct {
 	cloudName string
 	apiKey    string
 	apiSecret string
-	uploadURI *url.URL // To upload resources
-	adminURI  *url.URL // To use the admin API
 }
 
-// Upload response after uploading a file.
-type uploadResponse struct {
-	PublicID     string `json:"public_id"`
-	SecureURL    string `json:"secure_url"`
-	Version      uint   `json:"version"`
-	Format       string `json:"format"`
-	ResourceType string `json:"resource_type"` // "image" or "raw"
-	Size         int    `json:"bytes"`         // In bytes
+// Response from calling API.
+type Response struct {
+	PublicID     string `json:"public_id,omitempty"`
+	SecureURL    string `json:"secure_url,omitempty"`
+	Version      uint   `json:"version,omitempty"`
+	Format       string `json:"format,omitempty"`
+	ResourceType string `json:"resource_type,omitempty"`
+	Size         int    `json:"bytes,omitempty"` // In bytes
+	Result       string `json:"result,omitempty"`
 }
 
 // Our request type for a request being built
 type request struct {
-	uri string
-	buf *bytes.Buffer
-	w   *multipart.Writer
+	uri    string
+	method string
+	buf    *bytes.Buffer
+	w      *multipart.Writer
 }
 
 // Dial will use the url to connect to the Cloudinary service.
 // The uri parameter must be a valid URI with the cloudinary:// scheme,
-// e.g.
-//  cloudinary://api_key:api_secret@cloud_name
+// e.g. cloudinary://api_key:api_secret@cloud_name
 func Dial(uri string) (*Service, error) {
-	u, err := url.Parse(uri)
+	conn, err := url.Parse(uri)
 	if err != nil {
 		return nil, err
 	}
-	if u.Scheme != "cloudinary" {
-		return nil, errors.New("Missing cloudinary:// scheme in URI")
+
+	if conn.Scheme != "cloudinary" {
+		return nil, errors.New("missing cloudinary:// scheme in URI")
 	}
-	secret, exists := u.User.Password()
+
+	secret, exists := conn.User.Password()
 	if !exists {
 		return nil, errors.New("no API secret provided in URI")
 	}
+
 	s := &Service{
 		client:    http.Client{},
-		cloudName: u.Host,
-		apiKey:    u.User.Username(),
+		cloudName: conn.Host,
+		apiKey:    conn.User.Username(),
 		apiSecret: secret,
 	}
-	// Default upload URI to the service. Can change at runtime in the
-	// Upload() function for raw file uploading.
-	up, err := url.Parse(fmt.Sprintf("%s/%s/image/upload/", baseUploadURL, s.cloudName))
-	if err != nil {
-		return nil, err
-	}
-	s.uploadURI = up
 
 	return s, nil
 }
 
-// CloudName returns the cloud name used to access the Cloudinary service.
-func (s *Service) CloudName() string {
-	return s.cloudName
-}
-
-// DefaultUploadURI returns the default URI used to upload images to the Cloudinary service.
-func (s *Service) DefaultUploadURI() *url.URL {
-	return s.uploadURI
-}
-
-// UploadImageFile will upload a file to cloudinary
-func (s *Service) UploadImageFile(data io.Reader, filename string) (publicID *url.URL, err error) {
-	req, err := newRequest(s.DefaultUploadURI().String(), s.apiKey, s.apiSecret)
+// UploadFile will upload a file to cloudinary
+func (s *Service) UploadByFile(path, resourceType string) (*Response, error) {
+	// Open file path
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 
-	if err = req.addImageFileToRequest(data); err != nil {
+	r, err := s.newRequest(
+		fmt.Sprintf(uploadAPIFmt, s.cloudName, resourceType, "upload"),
+		http.MethodPost,
+		nil,
+	)
+	if err != nil {
 		return nil, err
 	}
 
-	return s.doRequest(req)
+	if err = r.addFile(f); err != nil {
+		return nil, err
+	}
+
+	return s.do(r)
 }
 
 // UploadImageURL will add an image to cloudinary when given a URL to the image
-func (s *Service) UploadImageURL(URL *url.URL, filename string) (publicID *url.URL, err error) {
-	req, err := newRequest(s.DefaultUploadURI().String(), s.apiKey, s.apiSecret)
+func (s *Service) UploadByURL(addr, resourceType string) (*Response, error) {
+	// Validate url
+	_, err := url.Parse(addr)
 	if err != nil {
 		return nil, err
 	}
 
-	if err = req.addImageURLToRequest(URL); err != nil {
+	r, err := s.newRequest(
+		fmt.Sprintf(uploadAPIFmt, s.cloudName, resourceType, "upload"),
+		http.MethodPost,
+		nil,
+	)
+	if err != nil {
 		return nil, err
 	}
 
-	return s.doRequest(req)
+	if err = r.addFileURL(addr); err != nil {
+		return nil, err
+	}
+
+	return s.do(r)
 }
 
-func newRequest(uri, apiKey, apiSecret string) (*request, error) {
+// Delete a resource in Cloudinary via public ID
+func (s *Service) UploadDestroy(publicID, resourceType string) error {
+	r, err := s.newRequest(
+		fmt.Sprintf(uploadAPIFmt, s.cloudName, resourceType, "destroy"),
+		http.MethodPost,
+		map[string]string{"public_id": publicID},
+	)
+	if err != nil {
+		return err
+	}
+
+	if err := r.w.WriteField("public_id", publicID); err != nil {
+		return err
+	}
+
+	resp, err := s.do(r)
+	if err != nil {
+		return err
+	}
+
+	if resp != nil && resp.Result == "ok" {
+		return nil
+	}
+
+	return errors.New("invalid response")
+}
+
+func (s *Service) newRequest(uri, method string, params map[string]string) (*request, error) {
 	buf := new(bytes.Buffer)
 	w := multipart.NewWriter(buf)
 
 	// Write API key
-	ak, err := w.CreateFormField("api_key")
-	if err != nil {
+	if err := w.WriteField("api_key", s.apiKey); err != nil {
 		return nil, err
 	}
-	ak.Write([]byte(apiKey))
 
 	// Write timestamp
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-	ts, err := w.CreateFormField("timestamp")
-	if err != nil {
+	if err := w.WriteField("timestamp", timestamp); err != nil {
 		return nil, err
 	}
-	ts.Write([]byte(timestamp))
 
-	// Write signature
+	// Generate signature
 	// BEWARE the generation of signatures is quite particular
 	// See this https://cloudinary.com/documentation/upload_images#generating_authentication_signatures
+	if params == nil {
+		params = map[string]string{}
+	}
+
+	params["timestamp"] = fmt.Sprintf("%s", timestamp)
+	keys := make([]string, 0, len(params))
+	for key := range params {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var sb strings.Builder
+	for i, key := range keys {
+		sb.WriteString(fmt.Sprintf("%s=%s", key, params[key]))
+		if i < len(keys)-1 {
+			sb.WriteString("&")
+		}
+	}
+
 	hash := sha1.New()
-	part := fmt.Sprintf("timestamp=%s%s", timestamp, apiSecret)
+	part := fmt.Sprintf("%s%s", sb.String(), s.apiSecret)
 
 	io.WriteString(hash, part)
-	signature := fmt.Sprintf("%x", hash.Sum(nil))
-
-	si, err := w.CreateFormField("signature")
-	if err != nil {
+	if err := w.WriteField("signature", fmt.Sprintf("%x", hash.Sum(nil))); err != nil {
 		return nil, err
 	}
-	si.Write([]byte(signature))
 
 	return &request{
-		buf: buf,
-		w:   w,
-		uri: uri,
+		buf:    buf,
+		w:      w,
+		method: method,
+		uri:    uri,
 	}, nil
 }
 
-func (r *request) addImageFileToRequest(data io.Reader) error {
-	fw, err := r.w.CreateFormFile("file", "file")
+func (r *request) addFile(data io.Reader) error {
+	f, err := r.w.CreateFormFile("file", "file")
 	if err != nil {
 		return err
 	}
@@ -180,21 +228,21 @@ func (r *request) addImageFileToRequest(data io.Reader) error {
 	if err != nil {
 		return err
 	}
-	_, err = fw.Write(tmp)
+	_, err = f.Write(tmp)
 	return err
 }
 
-func (r *request) addImageURLToRequest(url *url.URL) error {
-	return r.w.WriteField("file", url.String())
+func (r *request) addFileURL(url string) error {
+	return r.w.WriteField("file", url)
 }
 
-func (r *request) buildHTTPRequest() (req *http.Request, closer func() error, err error) {
+func (r *request) build() (req *http.Request, close func() error, err error) {
 	err = r.w.Close()
 	if err != nil {
 		return nil, nil, err
 	}
 
-	req, err = http.NewRequest(http.MethodPost, r.uri, r.buf)
+	req, err = http.NewRequest(r.method, r.uri, r.buf)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -203,84 +251,31 @@ func (r *request) buildHTTPRequest() (req *http.Request, closer func() error, er
 	return req, req.Body.Close, nil
 }
 
-func (s *Service) doRequest(req *request) (*url.URL, error) {
-	HTTPreq, closeReq, err := req.buildHTTPRequest()
+func (s *Service) do(r *request) (*Response, error) {
+	req, close, err := r.build()
 	if err != nil {
 		return nil, err
 	}
-	defer closeReq()
+	defer close()
 
-	resp, err := s.client.Do(HTTPreq)
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, errors.New("Request error: " + resp.Status + " Cld Err: " + resp.Header.Get("X-ClD-Error"))
+		return nil, errors.New("request error: " + resp.Status + " cld rrror: " + resp.Header.Get("X-ClD-Error"))
 	}
 
-	dec := json.NewDecoder(resp.Body)
-	var upInfo uploadResponse
-	if err := dec.Decode(&upInfo); err != nil {
-		return nil, err
-	}
-
-	imgURL, err := url.Parse(upInfo.SecureURL)
-	if err != nil {
-		return nil, err
-	}
-
-	return imgURL, nil
+	return decode(resp)
 }
 
-func handleHTTPResponse(resp *http.Response) (map[string]interface{}, error) {
-	if resp == nil {
-		return nil, errors.New("nil http response")
+func decode(resp *http.Response) (info *Response, err error) {
+	info = &Response{}
+	d := json.NewDecoder(resp.Body)
+	if err = d.Decode(info); err != nil {
+		return
 	}
-	dec := json.NewDecoder(resp.Body)
-	var msg interface{}
-	if err := dec.Decode(&msg); err != nil {
-		return nil, err
-	}
-	m := msg.(map[string]interface{})
-	if resp.StatusCode != http.StatusOK {
-		// JSON error looks like {"error":{"message":"Missing required parameter - public_id"}}
-		if e, ok := m["error"]; ok {
-			return nil, errors.New(e.(map[string]interface{})["message"].(string))
-		}
-		return nil, errors.New(resp.Status)
-	}
-	return m, nil
+	return
 }
-
-// // Delete deletes a resource uploaded to Cloudinary.
-// func (s *Service) Delete(publicID, prepend string) error {
-// 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-// 	data := url.Values{
-// 		"api_key":   []string{s.apiKey},
-// 		"public_id": []string{prepend + publicID},
-// 		"timestamp": []string{timestamp},
-// 	}
-
-// 	// Signature
-// 	hash := sha1.New()
-// 	part := fmt.Sprintf("public_id=%s&timestamp=%s%s", prepend+publicID, timestamp, s.apiSecret)
-// 	io.WriteString(hash, part)
-// 	data.Set("signature", fmt.Sprintf("%x", hash.Sum(nil)))
-
-// 	resp, err := http.PostForm(fmt.Sprintf("%s/%s/image/destroy/", baseUploadURL, s.cloudName), data)
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	m, err := handleHTTPResponse(resp)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	if e, ok := m["result"]; ok {
-// 		fmt.Println(e.(string))
-// 	}
-
-// 	return nil
-// }
