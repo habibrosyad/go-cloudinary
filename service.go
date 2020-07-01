@@ -98,7 +98,7 @@ func (s *Service) UploadByFile(path, resourceType string) (*Response, error) {
 		return nil, err
 	}
 
-	return UploadByIOReader(f, resourceType)
+	return s.UploadByIOReader(f, resourceType)
 }
 
 // UploadImageURL will add an image to cloudinary when given a URL to the image
@@ -126,7 +126,7 @@ func (s *Service) UploadByURL(addr, resourceType string) (*Response, error) {
 }
 
 // UploadByIOReader upload a file to cloudinary from a reader
-func UploadByIOReader(reader io.Reader, resourceType string) (*Response, error) {
+func (s *Service) UploadByIOReader(reader io.Reader, resourceType string) (*Response, error) {
 	r, err := s.newRequest(
 		fmt.Sprintf(uploadAPIFmt, s.cloudName, resourceType, "upload"),
 		http.MethodPost,
